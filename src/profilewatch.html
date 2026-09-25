@@ -7,7 +7,7 @@
   <header class="top">
     <div>
       <h1><span class="pulse"></span>ProfileWatch</h1>
-      <p>Live reputation health for every account — firms and individuals alike — with a six-signal health score, ranked triage, trend history, open incidents, improvement opportunities, and Claude-drafted remediation, monitored like uptime.</p>
+      <p>Live reputation health for every account — firms and individuals alike — with a six-signal health score, ranked triage, trend history, open incidents, improvement opportunities, and AI-drafted remediation, monitored like uptime.</p>
     </div>
     <button class="btn" id="digest-btn">Generate Weekly Digest</button>
   </header>
@@ -423,7 +423,7 @@
   async function handleAction(acc, action, card) {
     const panel = card.querySelector(`.ai-panel[data-panel="${action}"]`);
     panel.style.display = "block";
-    panel.innerHTML = `<div class="spinner-row"><div class="spinner"></div> Asking Claude…</div>`;
+    panel.innerHTML = `<div class="spinner-row"><div class="spinner"></div> Asking the AI…</div>`;
 
     try {
       const result = await fetchJSON(`/api/accounts/${acc.id}/${action}`, { method: "POST" });
@@ -480,12 +480,12 @@
   async function loadStatus() {
     try {
       const s = await fetchJSON("/api/status");
-      if (!s.anthropic_configured) {
+      if (!s.ai_configured) {
         banner.style.display = "block";
         banner.innerHTML =
-          "ANTHROPIC_API_KEY is not set on the server. Health scores and incidents below still work — " +
+          "GROQ_API_KEY is not set on the server. Health scores and incidents below still work — " +
           "but Explain/Draft Response, Save Play, Success Plan, and the Weekly Digest need it. " +
-          "Set <code>ANTHROPIC_API_KEY</code> in the server's environment and restart it.";
+          "Set <code>GROQ_API_KEY</code> in the server's environment and restart it.";
       }
     } catch (e) { /* non-fatal */ }
   }

@@ -1,11 +1,11 @@
 """
 ProfileWatch — monitors small-business online reputation ("customer profiles")
 the way an SRE monitors production services: a health score, SLA thresholds,
-incident detection, and Claude-powered auto-remediation.
+incident detection, and LLM-powered auto-remediation (open-weight models via Groq).
 
 Run with (from the repo root — main.py itself lives in src/):
     pip install -r src/requirements.txt
-    cp .env.example .env   # then fill in ANTHROPIC_API_KEY, or export it directly
+    cp .env.example .env   # then fill in GROQ_API_KEY, or export it directly
     python src/main.py
 
 Then open http://localhost:8000/
@@ -23,7 +23,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-import anthropic
+import groq
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,7 +37,7 @@ BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 DATA_PATH = BASE_DIR / "data" / "accounts.json"
 
-# Loads ANTHROPIC_API_KEY (and any PROFILEWATCH_* override) from a local .env
+# Loads GROQ_API_KEY (and any PROFILEWATCH_* override) from a local .env
 # file if present, without overriding whatever's already set in the shell
 # environment. No .env file is required — export vars manually and this is a
 # no-op. .env lives at the repo root (src/'s parent), not next to this file,
@@ -70,10 +70,11 @@ RESPONSE_QUALITY_THRESHOLD = int(os.environ.get("PROFILEWATCH_RESPONSE_QUALITY_T
 VELOCITY_INCIDENT_THRESHOLD = int(os.environ.get("PROFILEWATCH_VELOCITY_INCIDENT_THRESHOLD", "30"))
 VELOCITY_OPPORTUNITY_THRESHOLD = int(os.environ.get("PROFILEWATCH_VELOCITY_OPPORTUNITY_THRESHOLD", "40"))
 
-# Claude model used for all AI-generated content. Defaults to the model the
-# user asked for; override via env var if your account has a different one
-# configured.
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+# Open-weight model (served by Groq's free tier) used for all AI-generated
+# content. gpt-oss is one of the Groq models that supports strict JSON-schema
+# output, which every AI endpoint here depends on — pick another model only if
+# it also supports strict mode.
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Health-score methodology version. weekly_health_history points are stamped
 # with the formula version that produced them. There's no snapshot of the
@@ -650,7 +651,7 @@ def build_account_view(account: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Claude integration
+# LLM integration (Groq)
 # --------------------------------------------------------------------------
 
 INCIDENT_SYSTEM_PROMPT = (
@@ -807,51 +808,62 @@ SUCCESS_PLAN_SCHEMA = {
 }
 
 
-def get_anthropic_client() -> anthropic.Anthropic:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+def get_llm_client() -> groq.Groq:
+    if not os.environ.get("GROQ_API_KEY"):
         raise HTTPException(
             status_code=503,
             detail=(
-                "ANTHROPIC_API_KEY is not set. Export it before using any "
-                "Claude-powered feature, e.g. `export ANTHROPIC_API_KEY=sk-ant-...`. "
+                "GROQ_API_KEY is not set. Get a free key at console.groq.com and set "
+                "it in the server's environment before using any AI-powered feature. "
                 "The dashboard's health scores and incident detection still work "
                 "without it — only the explanations, response drafts, weekly "
                 "digest, save plays, and success plans need a key."
             ),
         )
-    # Reads ANTHROPIC_API_KEY from the environment automatically.
-    return anthropic.Anthropic()
+    # Reads GROQ_API_KEY from the environment automatically.
+    return groq.Groq()
 
 
-def call_claude_structured(system: str, user_content: str, schema: dict, max_tokens: int = 1024) -> dict:
-    client = get_anthropic_client()
+# gpt-oss is a reasoning model: its hidden reasoning tokens count against the
+# completion budget, so each call gets this much headroom on top of the
+# visible-answer budget it asks for.
+REASONING_TOKEN_HEADROOM = 2048
+
+
+def call_llm_structured(system: str, user_content: str, schema: dict, max_tokens: int = 1024) -> dict:
+    client = get_llm_client()
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user_content}],
-            output_config={"format": {"type": "json_schema", "schema": schema}},
+            max_completion_tokens=max_tokens + REASONING_TOKEN_HEADROOM,
+            reasoning_effort="low",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": schema, "strict": True},
+            },
         )
-    except anthropic.APIConnectionError as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach the Claude API: {exc}") from exc
-    except anthropic.APIStatusError as exc:
+    except groq.APIConnectionError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach the Groq API: {exc}") from exc
+    except groq.APIStatusError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Claude API error ({exc.status_code}): {exc.message}",
+            detail=f"Groq API error ({exc.status_code}): {exc.message}",
         ) from exc
 
-    if response.stop_reason == "refusal":
-        raise HTTPException(status_code=502, detail="Claude declined to respond to this request.")
-
-    text_block = next((b for b in response.content if b.type == "text"), None)
-    if text_block is None:
-        raise HTTPException(status_code=502, detail="Claude returned no text content.")
+    choice = response.choices[0]
+    if choice.finish_reason == "length":
+        raise HTTPException(status_code=502, detail="The AI response was cut off before it finished.")
+    if not choice.message.content:
+        raise HTTPException(status_code=502, detail="The AI returned no text content.")
 
     try:
-        return json.loads(text_block.text)
+        return json.loads(choice.message.content)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=502, detail="Claude returned malformed JSON.") from exc
+        raise HTTPException(status_code=502, detail="The AI returned malformed JSON.") from exc
 
 
 def generate_incident_explanation(account: dict[str, Any], view: dict[str, Any]) -> dict:
@@ -873,7 +885,7 @@ def generate_incident_explanation(account: dict[str, Any], view: dict[str, Any])
         "Analyze this account's open incidents and respond using the JSON "
         f"schema you were given.\n\n{json.dumps(context, indent=2)}"
     )
-    return call_claude_structured(INCIDENT_SYSTEM_PROMPT, user_content, INCIDENT_EXPLANATION_SCHEMA, max_tokens=1536)
+    return call_llm_structured(INCIDENT_SYSTEM_PROMPT, user_content, INCIDENT_EXPLANATION_SCHEMA, max_tokens=1536)
 
 
 def generate_weekly_digest(views: list[dict[str, Any]]) -> dict:
@@ -893,7 +905,7 @@ def generate_weekly_digest(views: list[dict[str, Any]]) -> dict:
         "Write the weekly digest for every account below, one paragraph plus one top "
         f"priority each, using the JSON schema you were given.\n\n{json.dumps(accounts_context, indent=2)}"
     )
-    return call_claude_structured(DIGEST_SYSTEM_PROMPT, user_content, DIGEST_SCHEMA, max_tokens=4096)
+    return call_llm_structured(DIGEST_SYSTEM_PROMPT, user_content, DIGEST_SCHEMA, max_tokens=4096)
 
 
 def generate_save_play(account: dict[str, Any], view: dict[str, Any]) -> dict:
@@ -908,7 +920,7 @@ def generate_save_play(account: dict[str, Any], view: dict[str, Any]) -> dict:
         "This account is flagged for churn risk. Draft the save play using the "
         f"JSON schema you were given.\n\n{json.dumps(context, indent=2)}"
     )
-    return call_claude_structured(SAVE_PLAY_SYSTEM_PROMPT, user_content, SAVE_PLAY_SCHEMA, max_tokens=512)
+    return call_llm_structured(SAVE_PLAY_SYSTEM_PROMPT, user_content, SAVE_PLAY_SCHEMA, max_tokens=512)
 
 
 def generate_success_plan(account: dict[str, Any], view: dict[str, Any]) -> dict:
@@ -926,7 +938,7 @@ def generate_success_plan(account: dict[str, Any], view: dict[str, Any]) -> dict
         "Write a prescriptive success plan for this account using the JSON "
         f"schema you were given.\n\n{json.dumps(context, indent=2)}"
     )
-    return call_claude_structured(SUCCESS_PLAN_SYSTEM_PROMPT, user_content, SUCCESS_PLAN_SCHEMA, max_tokens=1536)
+    return call_llm_structured(SUCCESS_PLAN_SYSTEM_PROMPT, user_content, SUCCESS_PLAN_SCHEMA, max_tokens=1536)
 
 
 # --------------------------------------------------------------------------
@@ -946,15 +958,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Every Claude call spends real Anthropic credits, so on a public deployment
+# Every AI call spends the Groq key's (rate-limited) quota, so on a public deployment
 # those endpoints (and the admin reload) require this shared key via the
 # X-Access-Key header. Unset = no check, so local dev is unchanged.
 ACCESS_KEY = os.environ.get("PROFILEWATCH_ACCESS_KEY", "")
 
 # Per-IP backstop in case the access key leaks. In-memory, so it resets on
 # restart and is per-instance — fine for a single Render instance.
-CLAUDE_RATE_LIMIT_PER_HOUR = int(os.environ.get("PROFILEWATCH_CLAUDE_RATE_LIMIT_PER_HOUR", "30"))
-_claude_calls: dict[str, deque[float]] = defaultdict(deque)
+AI_RATE_LIMIT_PER_HOUR = int(os.environ.get("PROFILEWATCH_AI_RATE_LIMIT_PER_HOUR", "30"))
+_ai_calls: dict[str, deque[float]] = defaultdict(deque)
 
 
 def require_access_key(x_access_key: str | None = Header(default=None)) -> None:
@@ -962,19 +974,19 @@ def require_access_key(x_access_key: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="A valid access key is required for this action.")
 
 
-def claude_rate_limit(request: Request) -> None:
+def ai_rate_limit(request: Request) -> None:
     forwarded = request.headers.get("x-forwarded-for")
     ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
     now = time.monotonic()
-    calls = _claude_calls[ip]
+    calls = _ai_calls[ip]
     while calls and now - calls[0] > 3600:
         calls.popleft()
-    if len(calls) >= CLAUDE_RATE_LIMIT_PER_HOUR:
+    if len(calls) >= AI_RATE_LIMIT_PER_HOUR:
         raise HTTPException(status_code=429, detail="Too many AI requests from this address — try again later.")
     calls.append(now)
 
 
-CLAUDE_GUARDS = [Depends(require_access_key), Depends(claude_rate_limit)]
+AI_GUARDS = [Depends(require_access_key), Depends(ai_rate_limit)]
 
 
 @app.get("/")
@@ -1001,7 +1013,7 @@ def stylesheet():
 def status():
     return {
         "ok": True,
-        "anthropic_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "ai_configured": bool(os.environ.get("GROQ_API_KEY")),
         "access_key_required": bool(ACCESS_KEY),
         "model": MODEL,
         "anchor_date": ANCHOR_DATE.isoformat(),
@@ -1023,7 +1035,7 @@ def get_account(account_id: str):
     return build_account_view(account)
 
 
-@app.post("/api/accounts/{account_id}/explain", dependencies=CLAUDE_GUARDS)
+@app.post("/api/accounts/{account_id}/explain", dependencies=AI_GUARDS)
 def explain_incident(account_id: str):
     account = find_account(account_id)
     if account is None:
@@ -1034,7 +1046,7 @@ def explain_incident(account_id: str):
     return generate_incident_explanation(account, view)
 
 
-@app.post("/api/accounts/{account_id}/save-play", dependencies=CLAUDE_GUARDS)
+@app.post("/api/accounts/{account_id}/save-play", dependencies=AI_GUARDS)
 def save_play(account_id: str):
     account = find_account(account_id)
     if account is None:
@@ -1045,7 +1057,7 @@ def save_play(account_id: str):
     return generate_save_play(account, view)
 
 
-@app.post("/api/accounts/{account_id}/success-plan", dependencies=CLAUDE_GUARDS)
+@app.post("/api/accounts/{account_id}/success-plan", dependencies=AI_GUARDS)
 def success_plan(account_id: str):
     """
     Unlike /explain (incident-gated) and /save-play (churn-risk-gated), this
@@ -1060,7 +1072,7 @@ def success_plan(account_id: str):
     return generate_success_plan(account, view)
 
 
-@app.post("/api/digest", dependencies=CLAUDE_GUARDS)
+@app.post("/api/digest", dependencies=AI_GUARDS)
 def weekly_digest():
     views = [build_account_view(a) for a in ACCOUNTS]
     return generate_weekly_digest(views)

@@ -102,7 +102,7 @@
   // Locally the API is same-origin; when hosted (e.g. Netlify) it lives on Render.
   const API_BASE = ["localhost", "127.0.0.1"].includes(location.hostname)
     ? ""
-    : "https://profilewatch-api.onrender.com";
+    : "https://profilewatch-eus4.onrender.com";
 
   async function fetchJSON(url, opts, retried) {
     const key = localStorage.getItem("profilewatch_access_key");

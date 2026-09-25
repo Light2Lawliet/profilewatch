@@ -179,7 +179,7 @@ The UI (`netlify.toml`) and API (`render.yaml`) deploy separately from the same 
 3. **Netlify** → Import the repo. It publishes only `index.html` + `profilewatch.css` into `dist/`.
 4. Back on Render, set `PROFILEWATCH_ALLOWED_ORIGINS=https://<your-site>.netlify.app` and redeploy.
 
-The UI calls `https://profilewatch-api.onrender.com` when it isn't on localhost. If your Render service has a different name, update `API_BASE` in `src/profilewatch.html`. When `PROFILEWATCH_ACCESS_KEY` is set, the UI asks for the key once, on the first AI button click, and stores it in the browser. AI calls are also rate-limited per IP (`PROFILEWATCH_AI_RATE_LIMIT_PER_HOUR`, default 30). Render's free tier sleeps when idle, so the first load after a pause can take about 50 seconds.
+The UI calls `https://profilewatch-eus4.onrender.com` when it isn't on localhost. If your Render service has a different name, update `API_BASE` in `src/profilewatch.html`. When `PROFILEWATCH_ACCESS_KEY` is set, the UI asks for the key once, on the first AI button click, and stores it in the browser. AI calls are also rate-limited per IP (`PROFILEWATCH_AI_RATE_LIMIT_PER_HOUR`, default 30). Render's free tier sleeps when idle, so the first load after a pause can take about 50 seconds.
 
 ## API
 

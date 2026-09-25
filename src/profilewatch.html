@@ -99,15 +99,10 @@
     }[type] || type;
   }
 
-  // Locally the API is same-origin; when hosted (e.g. Netlify) it lives on Render.
-  const API_BASE = ["localhost", "127.0.0.1"].includes(location.hostname)
-    ? ""
-    : "https://profilewatch-eus4.onrender.com";
-
   async function fetchJSON(url, opts, retried) {
     const key = localStorage.getItem("profilewatch_access_key");
     const headers = { ...((opts && opts.headers) || {}), ...(key ? { "X-Access-Key": key } : {}) };
-    const res = await fetch(API_BASE + url, { ...opts, headers });
+    const res = await fetch(url, { ...opts, headers });
     if (res.status === 401 && !retried) {
       const entered = prompt("Enter the ProfileWatch access key to use AI features:");
       if (entered) {

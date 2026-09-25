@@ -175,9 +175,9 @@ All of these can go in `.env` (see `.env.example`) or be exported in the shell �
 | `PROFILEWATCH_VELOCITY_INCIDENT_THRESHOLD` | `30` | Rating-velocity score below this (with a declining trend) triggers a `rating_velocity_decline` incident |
 | `PROFILEWATCH_VELOCITY_OPPORTUNITY_THRESHOLD` | `40` | Softer band above the incident threshold that surfaces a `mild_rating_decline` improvement opportunity instead |
 
-## Deploying (Netlify UI + Render API)
+## Deploying (Render only)
 
-The UI (`netlify.toml`) and API (`render.yaml`) deploy separately from the same GitHub repo.
+`main.py` serves the API *and* the UI (`GET /` and `GET /profilewatch.css`) from the same process, so one Render web service is the whole deployment — no separate static host needed.
 
 1. Push the repo to GitHub (check `git status` doesn't list `.env`).
 2. **Supabase**: create a free project, then in the SQL Editor run:
@@ -191,13 +191,19 @@ The UI (`netlify.toml`) and API (`render.yaml`) deploy separately from the same 
 3. Seed it: put `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` in your local `.env`
    alongside the existing `data/accounts.json`, then run
    `python3 src/scripts/seed_supabase.py` from the repo root.
-4. **Render** → New → Blueprint → select the repo. Set `GROQ_API_KEY`,
-   `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, and `PROFILEWATCH_ACCESS_KEY`
-   (any long random string).
-5. **Netlify** → Import the repo. It publishes only `index.html` + `profilewatch.css` into `dist/`.
-6. Back on Render, set `PROFILEWATCH_ALLOWED_ORIGINS=https://<your-site>.netlify.app` and redeploy.
+4. **Render** → New → Blueprint → select the repo (reads `render.yaml`). Set
+   `GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, and
+   `PROFILEWATCH_ACCESS_KEY` (any long random string).
 
-The UI calls `https://profilewatch-eus4.onrender.com` when it isn't on localhost. If your Render service has a different name, update `API_BASE` in `src/profilewatch.html`. When `PROFILEWATCH_ACCESS_KEY` is set, the UI asks for the key once, on the first AI button click, and stores it in the browser. AI calls are also rate-limited per IP (`PROFILEWATCH_AI_RATE_LIMIT_PER_HOUR`, default 30). Render's free tier sleeps when idle, so the first load after a pause can take about 50 seconds.
+That's it — the service URL Render gives you (e.g.
+`https://profilewatch-eus4.onrender.com`) is both the site and the API.
+Since the UI and API are same-origin now, `PROFILEWATCH_ALLOWED_ORIGINS`
+doesn't need to be set (browsers don't apply CORS to same-origin requests).
+When `PROFILEWATCH_ACCESS_KEY` is set, the UI asks for the key once, on the
+first AI button click, and stores it in the browser. AI calls are also
+rate-limited per IP (`PROFILEWATCH_AI_RATE_LIMIT_PER_HOUR`, default 30).
+Render's free tier sleeps when idle, so the first load after a pause can
+take about 50 seconds — that now affects the whole page, not just AI calls.
 
 ## API
 

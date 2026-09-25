@@ -1,0 +1,2 @@
+# Render (and any tool run from the repo root) installs from here; the real list is in src/.
+-r src/requirements.txt

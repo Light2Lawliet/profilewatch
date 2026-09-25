@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from supabase import Client, create_client
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -35,7 +36,6 @@ from fastapi.responses import FileResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
-DATA_PATH = BASE_DIR / "data" / "accounts.json"
 
 # Loads GROQ_API_KEY (and any PROFILEWATCH_* override) from a local .env
 # file if present, without overriding whatever's already set in the shell
@@ -43,6 +43,13 @@ DATA_PATH = BASE_DIR / "data" / "accounts.json"
 # no-op. .env lives at the repo root (src/'s parent), not next to this file,
 # so the path is explicit rather than relying on load_dotenv()'s own search.
 load_dotenv(REPO_ROOT / ".env")
+
+# The account fixture (real experience.com-sourced review/listing data) lives
+# in Supabase, not in the repo, so it's never exposed by being world-readable
+# on GitHub. The service_role key bypasses RLS, so it must only ever live in
+# this server's environment (Render), never sent to the browser.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 # The fixture data is dated relative to a fixed "as of" date rather than
 # wall-clock time, so the demo's health scores and incidents stay stable no
@@ -91,9 +98,18 @@ HEALTH_SCORE_FORMULA_VERSION = 2
 # Data loading
 # --------------------------------------------------------------------------
 
+def get_supabase() -> Client:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set — the account "
+            "data is stored in Supabase, not in this repo."
+        )
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
 def load_accounts() -> list[dict[str, Any]]:
-    with open(DATA_PATH, encoding="utf-8") as f:
-        return json.load(f)["accounts"]
+    rows = get_supabase().table("accounts").select("data").order("id").execute().data
+    return [row["data"] for row in rows]
 
 
 ACCOUNTS: list[dict[str, Any]] = load_accounts()

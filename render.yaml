@@ -2,14 +2,18 @@ services:
   - type: web
     name: profilewatch-api
     runtime: python
-    rootDir: src
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # No rootDir: the repo-root requirements.txt and main.py re-export the
+    # real app from src/, so Render's defaults (pip install -r
+    # requirements.txt, uvicorn main:app) work unmodified.
     healthCheckPath: /api/status
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
       - key: GROQ_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
         sync: false
       - key: PROFILEWATCH_ACCESS_KEY
         sync: false

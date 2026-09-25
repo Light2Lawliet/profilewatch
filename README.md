@@ -118,10 +118,15 @@ The churn-risk flag adds a second lever: it turns "we lost the account" into
 - **Backend**: Python + FastAPI (`src/main.py`)
 - **Frontend**: static HTML/CSS/JS (`src/profilewatch.html`,
   `src/profilewatch.css`), no framework, no build step
-- **Data**: seeded JSON fixture (`src/data/accounts.json`) — 23 accounts (a
-  mix of hand-built fixtures and real experience.com-sourced accounts), each
-  with reviews (rating, text, date, responded, response text) and directory
-  listings, some with intentionally inconsistent NAP data to simulate drift
+- **Data**: 31 accounts (a mix of hand-built fixtures and real
+  experience.com-sourced accounts), each with reviews (rating, text, date,
+  responded, response text) and directory listings, some with intentionally
+  inconsistent NAP data to simulate drift. Stored in Supabase Postgres (a
+  single `accounts` table, one row per account, the whole account as a
+  `jsonb` blob) rather than in this repo, so the real review data isn't
+  world-readable on GitHub. The server is the only reader, via its
+  `service_role` key; RLS is enabled on the table with no policies, so the
+  public `anon` key (if it ever leaked) grants zero access.
 - **AI**: open-weight `openai/gpt-oss-120b` served by Groq's free tier,
   using strict JSON-schema `response_format` for reliably parseable
   structured output on every AI call
@@ -175,9 +180,22 @@ All of these can go in `.env` (see `.env.example`) or be exported in the shell �
 The UI (`netlify.toml`) and API (`render.yaml`) deploy separately from the same GitHub repo.
 
 1. Push the repo to GitHub (check `git status` doesn't list `.env`).
-2. **Render** → New → Blueprint → select the repo. Set `GROQ_API_KEY` and `PROFILEWATCH_ACCESS_KEY` (any long random string).
-3. **Netlify** → Import the repo. It publishes only `index.html` + `profilewatch.css` into `dist/`.
-4. Back on Render, set `PROFILEWATCH_ALLOWED_ORIGINS=https://<your-site>.netlify.app` and redeploy.
+2. **Supabase**: create a free project, then in the SQL Editor run:
+   ```sql
+   create table accounts (id text primary key, data jsonb not null);
+   alter table accounts enable row level security;
+   ```
+   No policies needed — the server's `service_role` key bypasses RLS, and
+   with RLS on and zero policies, the `anon` key has no access at all.
+   Get the URL and `service_role` key from Settings → API.
+3. Seed it: put `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` in your local `.env`
+   alongside the existing `data/accounts.json`, then run
+   `python3 src/scripts/seed_supabase.py` from the repo root.
+4. **Render** → New → Blueprint → select the repo. Set `GROQ_API_KEY`,
+   `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, and `PROFILEWATCH_ACCESS_KEY`
+   (any long random string).
+5. **Netlify** → Import the repo. It publishes only `index.html` + `profilewatch.css` into `dist/`.
+6. Back on Render, set `PROFILEWATCH_ALLOWED_ORIGINS=https://<your-site>.netlify.app` and redeploy.
 
 The UI calls `https://profilewatch-eus4.onrender.com` when it isn't on localhost. If your Render service has a different name, update `API_BASE` in `src/profilewatch.html`. When `PROFILEWATCH_ACCESS_KEY` is set, the UI asks for the key once, on the first AI button click, and stores it in the browser. AI calls are also rate-limited per IP (`PROFILEWATCH_AI_RATE_LIMIT_PER_HOUR`, default 30). Render's free tier sleeps when idle, so the first load after a pause can take about 50 seconds.
 

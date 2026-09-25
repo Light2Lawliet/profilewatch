@@ -1,0 +1,5 @@
+# Publishes only the two static UI files — never src/ itself, which would
+# expose main.py, data/accounts.json, and scripts/.
+[build]
+  command = "mkdir -p dist && cp src/profilewatch.html dist/index.html && cp src/profilewatch.css dist/"
+  publish = "dist"

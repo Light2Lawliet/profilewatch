@@ -1,0 +1,595 @@
+<title>ProfileWatch</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/profilewatch.css" />
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1><span class="pulse"></span>ProfileWatch</h1>
+      <p>Live reputation health for every account — firms and individuals alike — with a six-signal health score, ranked triage, trend history, open incidents, improvement opportunities, and Claude-drafted remediation, monitored like uptime.</p>
+    </div>
+    <button class="btn" id="digest-btn">Generate Weekly Digest</button>
+  </header>
+
+  <div id="banner"></div>
+
+  <div id="digest-panel">
+    <h2>Weekly Digest</h2>
+    <div id="digest-body"></div>
+  </div>
+
+  <div class="stats-row summary-row" id="summary-row"></div>
+
+  <div class="controls-row">
+    <div class="pills" id="filter-pills">
+      <button type="button" class="pill active" data-filter="all">All</button>
+      <button type="button" class="pill" data-filter="critical">Critical</button>
+      <button type="button" class="pill" data-filter="warn">Warn</button>
+      <button type="button" class="pill" data-filter="healthy">Healthy</button>
+      <button type="button" class="pill" data-filter="churn">Churn risk</button>
+      <button type="button" class="pill" data-filter="needs_response">Needs response</button>
+    </div>
+    <div class="sort-control">
+      <label for="sort-select">Sort</label>
+      <select id="sort-select">
+        <option value="triage">Triage (worst first)</option>
+        <option value="score_asc">Score, low → high</option>
+        <option value="score_desc">Score, high → low</option>
+        <option value="churn_streak">Churn streak</option>
+        <option value="category">Category</option>
+        <option value="name">Name</option>
+      </select>
+    </div>
+  </div>
+  <div class="grid-meta" id="grid-meta"></div>
+
+  <div class="grid" id="grid"></div>
+
+  <footer>ProfileWatch demo · fixture data anchored at a fixed reference date so scores stay stable on repeat runs</footer>
+</div>
+
+<script>
+  const grid = document.getElementById("grid");
+  const banner = document.getElementById("banner");
+  const digestBtn = document.getElementById("digest-btn");
+  const digestPanel = document.getElementById("digest-panel");
+  const digestBody = document.getElementById("digest-body");
+  const gridMeta = document.getElementById("grid-meta");
+
+  let allAccounts = [];
+  let currentSort = "triage";
+  let currentStatusFilter = "all"; // all | critical | warn | healthy | churn | needs_response
+  let currentTypeFilter = null;    // "firm" | "individual" | null
+  let onlyNeedsImprovement = false;
+
+  function statusClass(score) {
+    if (score >= 80) return "ok";
+    if (score >= 60) return "warn";
+    return "crit";
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  function severityRank(severity) {
+    return severity === "high" ? 2 : severity === "medium" ? 1 : 0;
+  }
+
+  function incidentLabel(type) {
+    return {
+      low_health_score: "Low health score",
+      unanswered_negative_review: "Unanswered negative review",
+      nap_drift: "NAP drift",
+      low_quality_response: "Low-quality response",
+      rating_velocity_decline: "Rating trend declining",
+    }[type] || type;
+  }
+
+  function opportunityLabel(type) {
+    return {
+      low_response_rate: "Low response rate",
+      slow_response_time: "Slow response time",
+      recurring_complaint_theme: "Recurring complaint theme",
+      mild_rating_decline: "Mild rating decline",
+    }[type] || type;
+  }
+
+  // Locally the API is same-origin; when hosted (e.g. Netlify) it lives on Render.
+  const API_BASE = ["localhost", "127.0.0.1"].includes(location.hostname)
+    ? ""
+    : "https://profilewatch-api.onrender.com";
+
+  async function fetchJSON(url, opts, retried) {
+    const key = localStorage.getItem("profilewatch_access_key");
+    const headers = { ...((opts && opts.headers) || {}), ...(key ? { "X-Access-Key": key } : {}) };
+    const res = await fetch(API_BASE + url, { ...opts, headers });
+    if (res.status === 401 && !retried) {
+      const entered = prompt("Enter the ProfileWatch access key to use AI features:");
+      if (entered) {
+        localStorage.setItem("profilewatch_access_key", entered.trim());
+        return fetchJSON(url, opts, true);
+      }
+    }
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* no body */ }
+    if (!res.ok) {
+      const detail = body && body.detail ? body.detail : `Request failed (${res.status})`;
+      throw new Error(detail);
+    }
+    return body;
+  }
+
+  // ------------------------------------------------------------------
+  // Sorting — default "triage" ranks by open-incident severity + churn
+  // risk first, not raw score, so the account that most needs attention
+  // surfaces first even if a lower-scored account has fewer real problems.
+  // ------------------------------------------------------------------
+
+  function triageWeight(acc) {
+    const incidentWeight = acc.incidents.reduce(
+      (sum, i) => sum + (i.severity === "high" ? 3 : i.severity === "medium" ? 1 : 0), 0
+    );
+    const churnWeight = acc.churn_risk.churn_risk ? 2 : 0;
+    return incidentWeight + churnWeight;
+  }
+
+  function compareTriage(a, b) {
+    return (triageWeight(b) - triageWeight(a))
+        || (a.health_score - b.health_score)
+        || a.business_name.localeCompare(b.business_name);
+  }
+
+  function getComparator(mode) {
+    switch (mode) {
+      case "score_asc":
+        return (a, b) => a.health_score - b.health_score || a.business_name.localeCompare(b.business_name);
+      case "score_desc":
+        return (a, b) => b.health_score - a.health_score || a.business_name.localeCompare(b.business_name);
+      case "churn_streak":
+        return (a, b) =>
+          b.churn_risk.consecutive_weeks_declining - a.churn_risk.consecutive_weeks_declining || compareTriage(a, b);
+      case "category":
+        return (a, b) => (a.category || "").localeCompare(b.category || "") || a.business_name.localeCompare(b.business_name);
+      case "name":
+        return (a, b) => a.business_name.localeCompare(b.business_name);
+      default:
+        return compareTriage;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Filtering
+  // ------------------------------------------------------------------
+
+  function matchesStatusFilter(acc) {
+    switch (currentStatusFilter) {
+      case "critical": return statusClass(acc.health_score) === "crit";
+      case "warn": return statusClass(acc.health_score) === "warn";
+      case "healthy": return statusClass(acc.health_score) === "ok";
+      case "churn": return acc.churn_risk.churn_risk;
+      case "needs_response":
+        return acc.incidents.some((i) => i.type === "unanswered_negative_review" || i.type === "low_quality_response");
+      default: return true;
+    }
+  }
+
+  function matchesTypeFilter(acc) {
+    if (!currentTypeFilter) return true;
+    return currentTypeFilter === "firm" ? acc.account_type === "firm" : acc.account_type !== "firm";
+  }
+
+  function matchesImprovementFilter(acc) {
+    if (!onlyNeedsImprovement) return true;
+    return acc.incidents.length > 0 || (acc.improvement_opportunities || []).length > 0;
+  }
+
+  function matchesAllFilters(acc) {
+    return matchesStatusFilter(acc) && matchesTypeFilter(acc) && matchesImprovementFilter(acc);
+  }
+
+  // ------------------------------------------------------------------
+  // Trend sparkline + score-breakdown bar
+  // ------------------------------------------------------------------
+
+  function renderSparkline(history) {
+    if (!history || history.length === 0) return "";
+    const scores = history.map((h) => h.score);
+    const n = scores.length, w = 120, h = 36, pad = 4;
+    const minS = Math.min(...scores), maxS = Math.max(...scores);
+    const flat = maxS === minS;
+    const stepX = n > 1 ? (w - pad * 2) / (n - 1) : 0;
+    const points = scores.map((s, i) => {
+      const x = pad + stepX * i;
+      const y = flat ? h / 2 : pad + (h - pad * 2) * (1 - (s - minS) / (maxS - minS));
+      return [x, y];
+    });
+    const direction = scores[n - 1] > scores[0] ? "up" : scores[n - 1] < scores[0] ? "down" : "flat";
+    const colorVar = direction === "up" ? "var(--green)" : direction === "down" ? "var(--red)" : "var(--muted)";
+    const delta = scores[n - 1] - scores[0];
+    const title = history
+      .map((pt) => `${pt.week_ending}: ${pt.score}${pt.formula_version ? " (v" + pt.formula_version + ")" : ""}`)
+      .join("\n");
+
+    // If this card's history spans a scoring-methodology change, mark the
+    // boundary instead of drawing one continuous, misleadingly-comparable line.
+    let versionBreakX = null;
+    for (let i = 1; i < history.length; i++) {
+      if (history[i].formula_version !== history[i - 1].formula_version) {
+        versionBreakX = pad + stepX * (i - 0.5);
+        break;
+      }
+    }
+
+    return `
+      <svg class="sparkline" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img"
+           aria-label="4-week trend, ${delta >= 0 ? "+" : ""}${delta} points">
+        <title>${escapeHtml(title)}</title>
+        ${versionBreakX != null ? `<line x1="${versionBreakX}" y1="0" x2="${versionBreakX}" y2="${h}" stroke="var(--border)" stroke-width="1" stroke-dasharray="2,2" />` : ""}
+        <polyline points="${points.map((p) => p.join(",")).join(" ")}" fill="none"
+                  stroke="${colorVar}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
+        <circle cx="${points[n - 1][0]}" cy="${points[n - 1][1]}" r="2.5" fill="${colorVar}" />
+      </svg>
+      <span class="trend-delta ${direction}">${delta >= 0 ? "+" : ""}${delta}/4wk</span>`;
+  }
+
+  function renderScoreBreakdown(components) {
+    if (!components || components.length === 0) return "";
+    const total = components.reduce((s, c) => s + c.max, 0) || 1;
+    const fillClass = (pct) => (pct >= 80 ? "ok" : pct >= 50 ? "warn" : "crit");
+    const segs = components
+      .map((c) => {
+        const pct = c.max > 0 ? (c.contribution / c.max) * 100 : 100;
+        return `<div class="segment" style="width:${(c.max / total) * 100}%"
+             title="${escapeHtml(c.label)}: ${c.contribution.toFixed(1)}/${c.max} pts">
+          <div class="segment-fill ${fillClass(pct)}" style="width:${Math.min(100, pct)}%"></div>
+        </div>`;
+      })
+      .join("");
+    const legend = components
+      .map((c) => {
+        const pct = c.max > 0 ? (c.contribution / c.max) * 100 : 100;
+        return `<span class="legend-item"><span class="swatch ${fillClass(pct)}"></span>${escapeHtml(c.label)}</span>`;
+      })
+      .join("");
+    return `<div class="score-breakdown"><div class="breakdown-bar">${segs}</div><div class="breakdown-legend">${legend}</div></div>`;
+  }
+
+  // ------------------------------------------------------------------
+  // Inline drill-down — surfaces incident detail (real summary text, the
+  // flagged review, the conflicting listing fields) that used to be
+  // computed server-side and then discarded before reaching the screen.
+  // ------------------------------------------------------------------
+
+  function renderListingsTable(listings, napDetail) {
+    const mismatchByDirField = {};
+    ((napDetail && napDetail.mismatches) || []).forEach((m) => {
+      mismatchByDirField[`${m.directory}|${m.field}`] = m;
+    });
+    const severityClass = (m) => (!m ? "" : m.penalty >= 10 ? "mismatch-severe" : "mismatch-mild");
+    const rows = listings
+      .map((l) => {
+        const nameM = mismatchByDirField[`${l.directory}|name`];
+        const addrM = mismatchByDirField[`${l.directory}|address`];
+        const phoneM = mismatchByDirField[`${l.directory}|phone`];
+        return `<tr>
+          <td>${escapeHtml(l.directory)}</td>
+          <td class="${severityClass(nameM)}">${escapeHtml(l.name)}</td>
+          <td class="${severityClass(addrM)}">${escapeHtml(l.address)}</td>
+          <td class="${severityClass(phoneM)}">${escapeHtml(l.phone)}</td>
+        </tr>`;
+      })
+      .join("");
+    return `<table class="listings-table"><thead><tr><th>Directory</th><th>Name</th><th>Address</th><th>Phone</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function renderIncidentItem(incident, acc, cardCls) {
+    // Collapsed by default regardless of severity — a critical card with
+    // several high-severity incidents used to auto-expand every one of
+    // them, making the card enormous. Tap/click the row to see detail.
+    const open = false;
+    let detail = "";
+
+    if ((incident.type === "unanswered_negative_review" || incident.type === "low_quality_response") && incident.review) {
+      const r = incident.review;
+      detail = `<div class="review-detail">
+        <div class="review-meta">${"★".repeat(r.rating)}${"☆".repeat(5 - r.rating)} · ${escapeHtml(r.date)}</div>
+        <div class="review-text">"${escapeHtml(r.text)}"</div>
+        ${r.response_text ? `<div class="reply-text">Reply: "${escapeHtml(r.response_text)}"</div>` : ""}
+      </div>`;
+    } else if (incident.type === "nap_drift") {
+      detail = renderListingsTable(acc.listings, acc.nap_severity_detail);
+    } else if (incident.type === "rating_velocity_decline") {
+      const v = acc.rating_velocity;
+      detail = `<div class="velocity-detail">Recent reviews average ${v.recent_avg_pct}% vs. ${v.older_avg_pct}% earlier.</div>`;
+    }
+
+    // A severity dot, not another full pill badge — the badges row above
+    // already shows the type; repeating it here per-incident is what made
+    // this box so tall when an account had several incidents of one type.
+    const label = `<span class="severity-dot ${incident.severity}"></span>${escapeHtml(incident.summary)}`;
+    if (!detail) return `<li>${label}</li>`;
+    return `<li><details class="incident-detail" ${open ? "open" : ""}>
+      <summary>${label}</summary>
+      ${detail}
+    </details></li>`;
+  }
+
+  // ------------------------------------------------------------------
+  // Cards
+  // ------------------------------------------------------------------
+
+  function renderAccountCard(acc) {
+    const cls = statusClass(acc.health_score);
+    const card = document.createElement("div");
+    card.className = `card ${cls}`;
+
+    // Group by type so 3 unanswered-review incidents become one "×3" pill
+    // instead of 3 near-identical badges eating rows of vertical space —
+    // the incidents-box below already lists each one individually.
+    const incidentGroups = new Map();
+    acc.incidents.forEach((i) => {
+      const g = incidentGroups.get(i.type);
+      if (!g || severityRank(i.severity) > severityRank(g.severity)) {
+        incidentGroups.set(i.type, { severity: i.severity, count: (g?.count || 0) + 1 });
+      } else {
+        g.count += 1;
+      }
+    });
+    const badges = [...incidentGroups.entries()].map(
+      ([type, g]) => `<span class="badge ${g.severity}">${escapeHtml(incidentLabel(type))}${g.count > 1 ? ` ×${g.count}` : ""}</span>`
+    );
+    if (acc.churn_risk.churn_risk) {
+      badges.push(
+        `<span class="badge churn">Churn risk (${acc.churn_risk.churn_risk_level}) · ${acc.churn_risk.consecutive_weeks_declining}wk decline</span>`
+      );
+    }
+    (acc.improvement_opportunities || []).forEach((o) => {
+      badges.push(`<span class="badge opportunity">${escapeHtml(opportunityLabel(o.type))}</span>`);
+    });
+    if (badges.length === 0) {
+      badges.push(`<span class="badge clean">No open incidents</span>`);
+    }
+
+    const ratingText = acc.avg_rating_30d != null ? acc.avg_rating_30d.toFixed(1) + "★" : "—";
+    const napText = acc.nap_inconsistency_count === 0 ? "OK" : `${acc.nap_inconsistency_count} field(s)`;
+    const accountType = acc.account_type === "firm" ? "firm" : "individual";
+    const opportunities = acc.improvement_opportunities || [];
+
+    card.innerHTML = `
+      <div class="card-top">
+        <div>
+          <div class="name">${escapeHtml(acc.business_name)}</div>
+          <div class="cat">${escapeHtml(acc.category || "")}</div>
+          <div class="type-tag ${accountType}">${accountType === "firm" ? "🏢 Firm" : "🧑 Individual"}</div>
+        </div>
+        <div class="score-badge ${cls}">
+          <div>${acc.health_score}</div>
+          <div class="lbl">health</div>
+        </div>
+      </div>
+
+      <div class="trend-row">
+        <div class="trend-visual">${renderSparkline(acc.weekly_health_history)}</div>
+        ${renderScoreBreakdown(acc.score_components)}
+      </div>
+
+      <div class="stats-row">
+        <div class="stat"><div class="v">${acc.response_rate_24h}%</div><div class="k">Response &lt;24h</div></div>
+        <div class="stat"><div class="v">${ratingText}</div><div class="k">Avg rating 30d</div></div>
+        <div class="stat"><div class="v">${napText}</div><div class="k">NAP drift</div></div>
+      </div>
+
+      <div class="badges">${badges.join("")}</div>
+
+      ${acc.incidents.length > 0 ? `
+        <div class="incidents-box">
+          <div class="h">Open incidents</div>
+          <ul>${acc.incidents.map((i) => renderIncidentItem(i, acc, cls)).join("")}</ul>
+        </div>
+      ` : ""}
+
+      ${opportunities.length > 0 ? `
+        <div class="opportunities-box">
+          <div class="h">Where to improve</div>
+          <ul>${opportunities.map((o) => `<li>${escapeHtml(o.summary)}</li>`).join("")}</ul>
+        </div>
+      ` : ""}
+
+      <div class="card-actions">
+        <button class="btn secondary small" data-action="explain" ${acc.incidents.length === 0 ? "disabled" : ""}>
+          Explain &amp; draft response
+        </button>
+        ${acc.churn_risk.churn_risk ? `<button class="btn secondary small" data-action="save-play">Generate save play</button>` : ""}
+        <button class="btn secondary small" data-action="success-plan">Get success plan</button>
+      </div>
+
+      <div class="ai-panel" data-panel="explain"></div>
+      <div class="ai-panel" data-panel="save-play"></div>
+      <div class="ai-panel" data-panel="success-plan"></div>
+    `;
+
+    card.querySelectorAll("button[data-action]").forEach((btn) => {
+      btn.addEventListener("click", () => handleAction(acc, btn.dataset.action, card));
+    });
+
+    return card;
+  }
+
+  async function handleAction(acc, action, card) {
+    const panel = card.querySelector(`.ai-panel[data-panel="${action}"]`);
+    panel.style.display = "block";
+    panel.innerHTML = `<div class="spinner-row"><div class="spinner"></div> Asking Claude…</div>`;
+
+    try {
+      const result = await fetchJSON(`/api/accounts/${acc.id}/${action}`, { method: "POST" });
+
+      if (action === "explain") {
+        const steps = Array.isArray(result.action_plan) ? result.action_plan : [];
+        panel.innerHTML = `
+          <div class="section">
+            <div class="h">Root cause</div>
+            <div class="b">${escapeHtml(result.root_cause)}</div>
+          </div>
+          <div class="section">
+            <div class="h">Suggested response</div>
+            <div class="b reply-box">${escapeHtml(result.suggested_response)}</div>
+          </div>
+          <div class="section">
+            <div class="h">Action plan</div>
+            <ol class="action-plan">
+              ${steps.map((s) => `<li><span class="timeframe-tag">${escapeHtml(s.timeframe)}</span>${escapeHtml(s.action)}<div class="why">${escapeHtml(s.why_it_works)}</div></li>`).join("")}
+            </ol>
+          </div>
+        `;
+      } else if (action === "save-play") {
+        panel.innerHTML = `
+          <div class="section">
+            <div class="h">Save play for Customer Success</div>
+            <div class="b">${escapeHtml(result.save_play)}</div>
+          </div>
+        `;
+      } else if (action === "success-plan") {
+        const priorities = Array.isArray(result.priorities) ? result.priorities : [];
+        panel.innerHTML = `
+          <div class="section">
+            <div class="h">Overall assessment</div>
+            <div class="b">${escapeHtml(result.overall_assessment)}</div>
+          </div>
+          <div class="section">
+            <div class="h">Priorities</div>
+            <ol class="action-plan">
+              ${priorities.map((p) => `<li><span class="timeframe-tag">${escapeHtml(p.timeframe)}</span><strong>${escapeHtml(p.focus_area)}:</strong> ${escapeHtml(p.action)}<div class="why">${escapeHtml(p.expected_impact)}</div></li>`).join("")}
+            </ol>
+          </div>
+          <div class="section">
+            <div class="h">Definition of success</div>
+            <div class="b">${escapeHtml(result.definition_of_success)}</div>
+          </div>
+        `;
+      }
+    } catch (err) {
+      panel.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  async function loadStatus() {
+    try {
+      const s = await fetchJSON("/api/status");
+      if (!s.anthropic_configured) {
+        banner.style.display = "block";
+        banner.innerHTML =
+          "ANTHROPIC_API_KEY is not set on the server. Health scores and incidents below still work — " +
+          "but Explain/Draft Response, Save Play, Success Plan, and the Weekly Digest need it. " +
+          "Set <code>ANTHROPIC_API_KEY</code> in the server's environment and restart it.";
+      }
+    } catch (e) { /* non-fatal */ }
+  }
+
+  // ------------------------------------------------------------------
+  // Summary row — tiles double as clickable type/improvement filters.
+  // ------------------------------------------------------------------
+
+  function renderSummaryRow(accounts) {
+    const summaryRow = document.getElementById("summary-row");
+    const firms = accounts.filter((a) => a.account_type === "firm");
+    const individuals = accounts.filter((a) => a.account_type !== "firm");
+    const needsImprovement = (list) =>
+      list.filter((a) => a.incidents.length > 0 || (a.improvement_opportunities || []).length > 0).length;
+
+    const tile = (label, value, key) => {
+      const isActive = currentTypeFilter === key.type && onlyNeedsImprovement === key.improvement;
+      return `<button type="button" class="stat clickable ${isActive ? "active" : ""}" data-tile='${escapeHtml(JSON.stringify(key))}'>
+        <div class="v">${value}</div><div class="k">${label}</div>
+      </button>`;
+    };
+
+    summaryRow.innerHTML = [
+      tile("Firm accounts", firms.length, { type: "firm", improvement: false }),
+      tile("Individual accounts", individuals.length, { type: "individual", improvement: false }),
+      tile("Firms needing improvement", `${needsImprovement(firms)}/${firms.length}`, { type: "firm", improvement: true }),
+      tile("Individuals needing improvement", `${needsImprovement(individuals)}/${individuals.length}`, { type: "individual", improvement: true }),
+    ].join("");
+
+    summaryRow.querySelectorAll("button[data-tile]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = JSON.parse(btn.dataset.tile.replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">"));
+        if (currentTypeFilter === key.type && onlyNeedsImprovement === key.improvement) {
+          currentTypeFilter = null;
+          onlyNeedsImprovement = false;
+        } else {
+          currentTypeFilter = key.type;
+          onlyNeedsImprovement = key.improvement;
+        }
+        renderGrid();
+      });
+    });
+  }
+
+  function renderGrid() {
+    const filtered = allAccounts.filter(matchesAllFilters);
+    const sorted = [...filtered].sort(getComparator(currentSort));
+    grid.innerHTML = "";
+    if (sorted.length === 0) {
+      grid.innerHTML = `<div class="empty-state">No accounts match the current filter.</div>`;
+    } else {
+      sorted.forEach((acc) => grid.appendChild(renderAccountCard(acc)));
+    }
+    renderSummaryRow(allAccounts);
+    gridMeta.textContent = `Showing ${sorted.length} of ${allAccounts.length} accounts`;
+  }
+
+  async function loadAccounts() {
+    grid.innerHTML = `<div class="spinner-row"><div class="spinner"></div> Loading accounts…</div>`;
+    try {
+      const data = await fetchJSON("/api/accounts");
+      allAccounts = data.accounts;
+      renderGrid();
+    } catch (err) {
+      grid.innerHTML = `<div class="error-text">Failed to load accounts: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  digestBtn.addEventListener("click", async () => {
+    digestPanel.style.display = "block";
+    digestBtn.disabled = true;
+    digestBody.innerHTML = `<div class="spinner-row"><div class="spinner"></div> Writing this week's digest…</div>`;
+    try {
+      const result = await fetchJSON("/api/digest", { method: "POST" });
+      digestBody.innerHTML = result.digests
+        .map(
+          (d) => `
+            <div class="digest-item">
+              <div class="biz">${escapeHtml(d.business_name)}</div>
+              <div class="para">${escapeHtml(d.paragraph)}</div>
+              ${d.top_priority ? `<div class="top-priority">Top priority: ${escapeHtml(d.top_priority)}</div>` : ""}
+            </div>`
+        )
+        .join("");
+    } catch (err) {
+      digestBody.innerHTML = `<div class="error-text">${escapeHtml(err.message)}</div>`;
+    } finally {
+      digestBtn.disabled = false;
+    }
+  });
+
+  document.getElementById("filter-pills").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-filter]");
+    if (!btn) return;
+    currentStatusFilter = btn.dataset.filter;
+    document.querySelectorAll("#filter-pills .pill").forEach((p) => p.classList.toggle("active", p === btn));
+    renderGrid();
+  });
+
+  document.getElementById("sort-select").addEventListener("change", (e) => {
+    currentSort = e.target.value;
+    renderGrid();
+  });
+
+  loadStatus();
+  loadAccounts();
+</script>
